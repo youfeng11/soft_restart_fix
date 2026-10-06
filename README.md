@@ -1,6 +1,7 @@
 # 软重启 PID 修复 极速版 (Soft Restart PID Fix)
 
 [![KernelSU](https://img.shields.io/badge/KernelSU-Supported-brightgreen.svg)](https://kernelsu.org/)
+[![Build and Release](https://github.com/youfeng11/soft_restart_fix/actions/workflows/build.yml/badge.svg)](https://github.com/youfeng11/soft_restart_fix/actions/workflows/build.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 一个专为 Android（KernelSU）设计的超轻量级高效模块。在系统执行软重启（Userspace Reboot）前，自动且极速地重置 Linux 内核 PID 计数器，使其回绕并重置到安全低位范围，从而有效避开部分安全软件或反作弊机制对软重启后异常高 PID 的检测。
