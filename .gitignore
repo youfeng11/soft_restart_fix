@@ -1,6 +1,12 @@
-# Build outputs
+# Build outputs & binaries
 *.zip
 bin/
+build/
+dist/
+out/
+*.o
+*.so
+*.a
 
 # Temporary & test files
 test_*
