@@ -1,0 +1,16 @@
+# Build outputs
+*.zip
+bin/
+
+# Temporary & test files
+test_*
+*.log
+*.tmp
+
+# IDE & OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
