@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -38,6 +40,27 @@ jobs:
           name: soft_restart_fix
           path: soft_restart_fix.zip
 
+      - name: Generate Release Changelog
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "# 更新日志 (${GITHUB_REF_NAME})" > changelog.md
+          echo "" >> changelog.md
+
+          # 提取当前 Tag 的注释信息
+          TAG_MSG="$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+          if [ -n "$TAG_MSG" ]; then
+            echo "$TAG_MSG" >> changelog.md
+          elif [ -f changelog.md.static ]; then
+            cat changelog.md.static >> changelog.md
+          else
+            # 若 Tag 无额外说明，则取最新一条 Commit 提交信息
+            git log -1 --pretty=format:"%B" >> changelog.md
+          fi
+
+          echo "=== 自动生成的 changelog.md ==="
+          cat changelog.md
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -45,6 +68,6 @@ jobs:
           files: |
             soft_restart_fix.zip
             changelog.md
-          generate_release_notes: true
+          body_path: changelog.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
