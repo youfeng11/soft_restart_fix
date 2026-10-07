@@ -110,7 +110,7 @@ static double get_elapsed_ms(struct timespec *start, struct timespec *end) {
 }
 
 // 尝试利用 /proc/sys/kernel/pid_max 触发内核级瞬间回绕（毫秒级极速完成）
-static int try_fast_wrap(long target) {
+static int try_fast_wrap(void) {
     int fd = open("/proc/sys/kernel/pid_max", O_RDWR);
     if (fd < 0) {
         log_err("[pid_wrap] 打开 /proc/sys/kernel/pid_max 失败: %s (errno=%d)\n", strerror(errno), errno);
@@ -197,54 +197,35 @@ static int try_fast_wrap(long target) {
         return 0;
     }
 
-    log_info("[pid_wrap] 内核极速回绕成功！历经 %d 次 fork，PID 已重置到低位: %d (已恢复原始 pid_max=%ld)\n",
+    // 回绕成功后立刻完成，不再做多余的单步循环累加！
+    log_info("[pid_wrap] 内核极速回绕成功！仅历经 %d 次 fork，PID 已重置到低位: %d (已恢复原始 pid_max=%ld)\n",
              attempts, p, orig_pid_max);
-
-    int walk_count = 0;
-    // 回绕成功后，PID 已重置到 ~300 低位区间，快速递增至指定目标
-    while (p < target) {
-        walk_count++;
-        p = vfork();
-        if (p == 0) _exit(0);
-        if (p < 0) {
-            sched_yield();
-            continue;
-        }
-    }
-
-    if (walk_count > 0) {
-        log_info("[pid_wrap] 从低位 PID(%d) 递增至目标 PID(%ld)，历经 %d 次 fork\n", last, target, walk_count);
-    }
-    log_info("[pid_wrap] 极速通道完成，当前最后 PID: %d\n", p);
     return 1;
 }
 
-int main(int argc, char **argv) {
+int main(void) {
     init_logger();
 
     struct timespec ts_start, ts_end;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
-    long target = argc > 1 ? atol(argv[1]) : 1000;
     pid_t init_pid = getpid();
-
-    log_info("[pid_wrap] 开始执行 PID 修复, 目标 PID=%ld, 当前进程 PID=%d\n", target, init_pid);
+    log_info("[pid_wrap] 开始执行 PID 修复, 当前进程 PID=%d\n", init_pid);
 
     nice(-20);
     signal(SIGCHLD, SIG_IGN);
 
     // 优先尝试基于 pid_max 的极速重置（毫秒级）
-    if (try_fast_wrap(target)) {
+    if (try_fast_wrap()) {
         clock_gettime(CLOCK_MONOTONIC, &ts_end);
         log_info("[pid_wrap] ✅ 极速通道成功！总耗时: %.2f ms\n", get_elapsed_ms(&ts_start, &ts_end));
         close_logger();
         return 0;
     }
 
-    // 兜底方案：常规循环回绕
+    // 兜底方案：常规循环回绕（回绕即停）
     log_info("[pid_wrap] ⚠️ 极速通道不可用，降级进入常规循环回绕 (逐个遍历消耗 PID，单核运行中)...\n");
     pid_t last = init_pid, cur;
-    int wrapped = 0;
     unsigned long fork_count = 0;
     while (1) {
         fork_count++;
@@ -254,13 +235,15 @@ int main(int argc, char **argv) {
             sched_yield();
             continue;
         }
-        if (cur < last) wrapped = 1;
-        if (wrapped && cur >= target) break;
+        if (cur < last) {
+            // 一旦回绕到低位，立刻退出！
+            break;
+        }
         last = cur;
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    log_info("[pid_wrap] 降级通道完成: 共遍历 %lu 次 fork, 最终 PID=%d, 总耗时: %.2f ms (%.2f s)\n",
+    log_info("[pid_wrap] 降级通道完成: 共遍历 %lu 次 fork, 最终重置到低位 PID=%d, 总耗时: %.2f ms (%.2f s)\n",
              fork_count, cur, get_elapsed_ms(&ts_start, &ts_end), get_elapsed_ms(&ts_start, &ts_end) / 1000.0);
 
     close_logger();
