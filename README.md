@@ -1,4 +1,4 @@
-# 软重启 PID 修复 极速版 (Soft Restart PID Fix)
+# 软重启 PID 修复 (Soft Restart PID Fix)
 
 [![KernelSU](https://img.shields.io/badge/KernelSU-Supported-brightgreen.svg)](https://kernelsu.org/)
 [![Build and Release](https://github.com/youfeng11/soft_restart_fix/actions/workflows/build.yml/badge.svg)](https://github.com/youfeng11/soft_restart_fix/actions/workflows/build.yml)
