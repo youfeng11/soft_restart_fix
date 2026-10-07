@@ -1,7 +1,7 @@
 id=soft_restart_fix
 name=软重启PID修复 极速版
-version=v1.1.0
-versionCode=10100
+version=v1.1.1
+versionCode=10101
 author=由风
 description=在软重启前自动重置内核PID计数器，以避开安全检测。\n得益于原生二进制的执行效率，因此本模块造成的软重启延迟几乎无感！\n与其他类似模块相比效率提升数倍！
 updateJson=https://raw.githubusercontent.com/youfeng11/soft_restart_fix/main/update.json
