@@ -22,6 +22,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -43,22 +44,33 @@ jobs:
       - name: Generate Release Changelog
         if: startsWith(github.ref, 'refs/tags/')
         run: |
+          git fetch --tags --force 2>/dev/null || true
+
           echo "# 更新日志 (${GITHUB_REF_NAME})" > changelog.md
           echo "" >> changelog.md
 
-          # 提取当前 Tag 的注释信息
-          TAG_MSG="$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-
-          if [ -n "$TAG_MSG" ]; then
+          # 1. 提取当前 Tag 的说明信息
+          TAG_MSG="$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}")"
+          if [ -n "$(echo "$TAG_MSG" | tr -d '[:space:]')" ]; then
             echo "$TAG_MSG" >> changelog.md
-          elif [ -f changelog.md.static ]; then
-            cat changelog.md.static >> changelog.md
-          else
-            # 若 Tag 无额外说明，则取最新一条 Commit 提交信息
-            git log -1 --pretty=format:"%B" >> changelog.md
+            echo "" >> changelog.md
           fi
 
-          echo "=== 自动生成的 changelog.md ==="
+          # 2. 提取自上个版本 Tag 至今的全部提交记录
+          PREV_TAG="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS="$(git log "${PREV_TAG}..${GITHUB_REF_NAME}" --no-merges --pretty=format:"- %s (%h)" 2>/dev/null || true)"
+          else
+            COMMITS="$(git log -10 --no-merges --pretty=format:"- %s (%h)" 2>/dev/null || true)"
+          fi
+
+          if [ -n "$COMMITS" ]; then
+            echo "### 提交明细" >> changelog.md
+            echo "$COMMITS" >> changelog.md
+            echo "" >> changelog.md
+          fi
+
+          echo "=== 自动生成的完整 changelog.md ==="
           cat changelog.md
 
       - name: Create GitHub Release
