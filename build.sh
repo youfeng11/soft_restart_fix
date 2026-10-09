@@ -182,7 +182,6 @@ files_to_pack = [
     "module.prop",
     "customize.sh",
     "emulated-soft-reboot.sh",
-    "LICENSE",
     "bin/pid_wrap_arm64",
     "bin/pid_wrap_armeabi",
     "bin/pid_wrap_x86",
@@ -199,7 +198,7 @@ print(f"Zip 包生成成功: {zip_filename}")
 '
 elif command -v zip >/dev/null 2>&1; then
     rm -f "$ZIP_NAME"
-    zip -r -q "$ZIP_NAME" module.prop customize.sh emulated-soft-reboot.sh LICENSE bin/
+    zip -r -q "$ZIP_NAME" module.prop customize.sh emulated-soft-reboot.sh bin/
     echo "Zip 包生成成功: $ZIP_NAME"
 else
     echo "错误: 未找到 python3 或 zip 命令，无法打包" >&2
