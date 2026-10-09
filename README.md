@@ -10,10 +10,10 @@
 
 ## ✨ 核心特性
 
-- **🚀 毫秒级极速重置**：核心采用 C 语言原生实现，利用 `/proc/sys/kernel/pid_max` 触发内核级瞬间回绕机制，重置耗时降至微秒/毫秒级，软重启几乎零感知延迟。
-- **🛡️ 健全的安全与回退机制**：
-  - 临时调整参数期间自动屏蔽进程信号，确保原始 `pid_max` 100% 立即恢复。
-  - 若处于受限环境，全自动无缝回退至常规多核心 `vfork()` 循环模式。
+- **🚀 毫秒级极速重置**：核心采用 Rust 语言原生实现，利用 `/proc/sys/kernel/pid_max` 触发内核级瞬间回绕机制，重置耗时降至微秒/毫秒级，软重启几乎零感知延迟。
+- **🛡️ 健全的 RAII 安全与回退机制**：
+  - 基于 Rust `Drop` trait 实现 `PidMaxGuard`，在临时调整参数期间自动屏蔽进程信号，确保原始 `pid_max` 无论任何异常路径 100% 自动安全复原。
+  - 若处于受限环境（如 SELinux 拦截），全自动无缝回退至常规 `vfork()` 循环模式。
   - 提供 Shell 原生备用兜底逻辑（[`emulated-soft-reboot.sh`](emulated-soft-reboot.sh)）。
 - **📱 全架构适配**：支持主流所有 Android CPU 架构：
   - `ARM64` (`aarch64`)
@@ -28,11 +28,13 @@
 
 ```text
 soft_restart_fix/
+├── Cargo.toml                 # Rust 项目依赖与优化配置
+├── src/
+│   └── main.rs                # 核心 Rust 源码（PID 回绕消耗器）
 ├── module.prop                # 模块元信息说明
-├── pid_wrap.c                 # 核心 C 语言源码（PID 回绕消耗器）
 ├── emulated-soft-reboot.sh    # 软重启执行脚本（含兜底逻辑）
 ├── customize.sh               # KernelSU 模块安装脚本（架构适配）
-├── build.sh                   # 跨环境构建与 Zip 打包脚本
+├── build.sh                   # 跨架构 Cargo 构建与 Zip 打包脚本
 └── bin/                       # 各架构预编译二进制文件
     ├── pid_wrap_arm64
     ├── pid_wrap_armeabi
@@ -48,6 +50,7 @@ soft_restart_fix/
 
 ### 前置要求
 - Linux / macOS 环境
+- Rust 工具链（`cargo` 与 `rustup`）
 - Android NDK（支持 r21 ~ r30+）
 - Python 3 或 `zip` 命令
 

@@ -24,6 +24,11 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android, i686-linux-android
+
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         with:

@@ -7,7 +7,40 @@ cd "$PROJECT_DIR"
 
 API_LEVEL="${API_LEVEL:-21}"
 
-# 1. 查找 NDK 路径
+# 1. 检查 Rust 环境
+if ! command -v cargo >/dev/null 2>&1; then
+    if [ -f "$HOME/.cargo/env" ]; then
+        source "$HOME/.cargo/env"
+    fi
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "错误: 未找到 cargo 命令！" >&2
+    echo "请先安装 Rust 工具链: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
+    exit 1
+fi
+
+echo "使用 Cargo 版本: $(cargo --version)"
+
+# 2. 自动检查并安装目标架构 (若使用 rustup)
+TARGETS=(
+    "aarch64-linux-android"
+    "armv7-linux-androideabi"
+    "x86_64-linux-android"
+    "i686-linux-android"
+)
+
+if command -v rustup >/dev/null 2>&1; then
+    INSTALLED_TARGETS="$(rustup target list --installed)"
+    for t in "${TARGETS[@]}"; do
+        if ! echo "$INSTALLED_TARGETS" | grep -q "^${t}\$"; then
+            echo "正在添加目标架构: $t ..."
+            rustup target add "$t"
+        fi
+    done
+fi
+
+# 3. 查找 Android NDK 路径
 find_ndk() {
     # 命令行参数优先
     if [ -n "$1" ] && [ -d "$1/toolchains/llvm/prebuilt" ]; then
@@ -61,7 +94,7 @@ NDK_PATH="$(find_ndk "$1")" || {
 
 echo "使用 NDK 路径: $NDK_PATH"
 
-# 2. 自动检测 LLVM prebuilt 目录（适配当前宿主系统和架构）
+# 4. 自动检测 LLVM prebuilt 目录（适配当前宿主系统和架构）
 PREBUILT_BASE="$NDK_PATH/toolchains/llvm/prebuilt"
 HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 HOST_ARCH="$(uname -m)"
@@ -72,13 +105,11 @@ case "$HOST_ARCH" in
 esac
 
 TOOLCHAIN=""
-# 优先查找当前宿主匹配的目录 (例如 linux-x86_64, linux-arm64, darwin-arm64 等)
 if [ -d "$PREBUILT_BASE/${HOST_OS}-${HOST_ARCH_NAME}/bin" ]; then
     TOOLCHAIN="$PREBUILT_BASE/${HOST_OS}-${HOST_ARCH_NAME}/bin"
 elif [ -d "$PREBUILT_BASE/${HOST_OS}-x86_64/bin" ]; then
     TOOLCHAIN="$PREBUILT_BASE/${HOST_OS}-x86_64/bin"
 else
-    # 回退到 prebuilt 下首个包含 bin 的目录
     for d in "$PREBUILT_BASE"/*; do
         if [ -d "$d/bin" ]; then
             TOOLCHAIN="$d/bin"
@@ -96,32 +127,51 @@ echo "使用工具链路径: $TOOLCHAIN"
 
 mkdir -p bin
 
-# 3. 跨架构编译函数 (兼容带 API 版本号的脚本包装与直接传 --target 的方式)
-compile_binary() {
-    local target="$1"
-    local wrapper_name="$2"
+# 5. 跨架构 Cargo 编译函数
+compile_rust_binary() {
+    local rust_target="$1"
+    local clang_wrapper="$2"
     local output_file="$3"
+    local linker_env_var="$4"
 
-    echo "正在编译 $output_file ..."
-    if [ -x "$TOOLCHAIN/$wrapper_name" ]; then
-        "$TOOLCHAIN/$wrapper_name" -O3 -s pid_wrap.c -o "$output_file"
-    elif [ -x "$TOOLCHAIN/clang" ]; then
-        "$TOOLCHAIN/clang" --target="$target" -O3 -s pid_wrap.c -o "$output_file"
-    else
-        echo "错误: 找不到适用于 $target 的编译工具！" >&2
+    echo "----------------------------------------"
+    echo "正在编译 [$rust_target] -> $output_file ..."
+
+    local linker_path="$TOOLCHAIN/$clang_wrapper"
+    if [ ! -x "$linker_path" ]; then
+        linker_path="$TOOLCHAIN/clang"
+    fi
+
+    export "$linker_env_var"="$linker_path"
+
+    cargo build --release --target "$rust_target"
+
+    local built_bin="target/$rust_target/release/pid_wrap"
+    if [ ! -f "$built_bin" ]; then
+        echo "错误: 编译产物不存在: $built_bin" >&2
         return 1
     fi
+
+    cp -f "$built_bin" "$output_file"
+
+    if [ -x "$TOOLCHAIN/llvm-strip" ]; then
+        "$TOOLCHAIN/llvm-strip" -s "$output_file" 2>/dev/null || true
+    fi
+    echo "完成: $output_file ($(ls -lh "$output_file" | awk '{print $5}'))"
 }
 
-compile_binary "aarch64-linux-android${API_LEVEL}" "aarch64-linux-android${API_LEVEL}-clang" "bin/pid_wrap_arm64"
-compile_binary "armv7a-linux-androideabi${API_LEVEL}" "armv7a-linux-androideabi${API_LEVEL}-clang" "bin/pid_wrap_armeabi"
-compile_binary "x86_64-linux-android${API_LEVEL}" "x86_64-linux-android${API_LEVEL}-clang" "bin/pid_wrap_x86_64"
-compile_binary "i686-linux-android${API_LEVEL}" "i686-linux-android${API_LEVEL}-clang" "bin/pid_wrap_x86"
+compile_rust_binary "aarch64-linux-android" "aarch64-linux-android${API_LEVEL}-clang" "bin/pid_wrap_arm64" "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+compile_rust_binary "armv7-linux-androideabi" "armv7a-linux-androideabi${API_LEVEL}-clang" "bin/pid_wrap_armeabi" "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER"
+compile_rust_binary "x86_64-linux-android" "x86_64-linux-android${API_LEVEL}-clang" "bin/pid_wrap_x86_64" "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER"
+compile_rust_binary "i686-linux-android" "i686-linux-android${API_LEVEL}-clang" "bin/pid_wrap_x86" "CARGO_TARGET_I686_LINUX_ANDROID_LINKER"
 
 chmod +x bin/* *.sh 2>/dev/null || true
 
-# 4. 打包 ZIP（优先 Python3，回退至 zip 命令）
+# 6. 打包 ZIP（优先 Python3，回退至 zip 命令）
 ZIP_NAME="soft_restart_fix.zip"
+
+echo "----------------------------------------"
+echo "正在打包 $ZIP_NAME ..."
 
 if command -v python3 >/dev/null 2>&1; then
     python3 -c '

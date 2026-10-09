@@ -1,0 +1,17 @@
+[package]
+name = "pid_wrap"
+version = "1.2.0"
+edition = "2021"
+authors = ["由风"]
+description = "Kernel PID wrap fast reset tool for Android soft restart"
+license = "Apache-2.0"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

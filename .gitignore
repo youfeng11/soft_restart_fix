@@ -1,4 +1,5 @@
 # Build outputs & binaries
+target/
 *.zip
 bin/
 build/
