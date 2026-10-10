@@ -10,6 +10,7 @@ elif [ -x "$MODDIR/pid_wrap" ]; then
     exit $?
 fi
 
+# 原生二进制不可用时，进入纯 Shell 循环回绕
 last_pid=$$
 count=0
 
@@ -22,3 +23,21 @@ while :; do
     last_pid=$current_pid
 done
 wait 2>/dev/null
+
+# 更新模块可变简介（Shell 兜底）
+tag="[✅正常 (Shell)]"
+prop_file="$MODDIR/module.prop"
+
+if [ -f "$prop_file" ]; then
+    orig_desc=$(grep '^description=' "$prop_file" | head -n 1 | sed 's/^description=//' | sed 's/^\[[^]]*\][[:space:]]*//' | sed 's/^【[^】]*】[[:space:]]*//')
+    new_desc="${tag} ${orig_desc}"
+    escaped_desc=$(printf '%s\n' "$new_desc" | sed 's/\\/\\\\/g')
+    sed -i "s|^description=.*|description=${escaped_desc}|" "$prop_file" 2>/dev/null || true
+
+    export KSU_MODULE="soft_restart_fix"
+    if [ -x "/data/adb/ksu/bin/ksud" ]; then
+        /data/adb/ksu/bin/ksud module config set override.description "$new_desc" >/dev/null 2>&1 || true
+    elif command -v ksud >/dev/null 2>&1; then
+        ksud module config set override.description "$new_desc" >/dev/null 2>&1 || true
+    fi
+fi

@@ -7,21 +7,37 @@ struct Logger {
     file: Option<File>,
 }
 
+fn get_module_dir() -> PathBuf {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let module_dir = if exe_dir.file_name().and_then(|s| s.to_str()) == Some("bin") {
+                exe_dir.parent().unwrap_or(exe_dir)
+            } else {
+                exe_dir
+            };
+            if module_dir.join("module.prop").exists() {
+                return module_dir.to_path_buf();
+            }
+            return module_dir.to_path_buf();
+        }
+    }
+
+    let default_path = PathBuf::from("/data/adb/modules/soft_restart_fix");
+    if default_path.join("module.prop").exists() {
+        return default_path;
+    }
+
+    if std::path::Path::new("module.prop").exists() {
+        return PathBuf::from(".");
+    }
+
+    default_path
+}
+
 impl Logger {
     fn init() -> Self {
-        let mut log_path = PathBuf::from("/data/adb/modules/soft_restart_fix/pid_wrap.log");
-
-        // 尝试根据当前可执行文件路径推导模块根目录
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let module_dir = if exe_dir.file_name().and_then(|s| s.to_str()) == Some("bin") {
-                    exe_dir.parent().unwrap_or(exe_dir)
-                } else {
-                    exe_dir
-                };
-                log_path = module_dir.join("pid_wrap.log");
-            }
-        }
+        let module_dir = get_module_dir();
+        let log_path = module_dir.join("pid_wrap.log");
 
         let mut file_opt = None;
 
@@ -151,6 +167,88 @@ unsafe fn vfork_exit() -> libc::pid_t {
         libc::_exit(0);
     }
     pid
+}
+
+fn update_ksud_override_description(full_desc: &str) {
+    let ksud_path = if std::path::Path::new("/data/adb/ksu/bin/ksud").exists() {
+        Some("/data/adb/ksu/bin/ksud")
+    } else if std::path::Path::new("/system/bin/ksud").exists() {
+        Some("/system/bin/ksud")
+    } else {
+        None
+    };
+
+    if let Some(path) = ksud_path {
+        let _ = std::process::Command::new(path)
+            .env("KSU_MODULE", "soft_restart_fix")
+            .args(["module", "config", "set", "override.description", full_desc])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+fn update_module_description(tag: &str, logger: &mut Logger) {
+    let module_dir = get_module_dir();
+    let prop_path = module_dir.join("module.prop");
+
+    let (content, target_path) = if let Ok(c) = std::fs::read_to_string(&prop_path) {
+        (c, prop_path)
+    } else if let Ok(c) = std::fs::read_to_string("module.prop") {
+        (c, PathBuf::from("module.prop"))
+    } else {
+        logger.log_info("[pid_wrap] 未找到 module.prop，跳过简介更新\n");
+        return;
+    };
+
+    let mut new_lines = Vec::new();
+    let mut updated_desc = String::new();
+
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("description=") {
+            let mut val = rest.trim();
+
+            // 去除已有的 [...] 或 【...】 状态前缀，保证幂等性
+            if val.starts_with('[') {
+                if let Some(idx) = val.find(']') {
+                    val = val[idx + 1..].trim();
+                }
+            } else if val.starts_with('【') {
+                if let Some(idx) = val.find('】') {
+                    val = val[idx + '】'.len_utf8()..].trim();
+                }
+            }
+
+            // 去除前缀后的 \\n 字符对
+            while val.starts_with("\\n") {
+                val = val[2..].trim();
+            }
+
+            let full_desc = format!("{} {}", tag, val);
+            new_lines.push(format!("description={}", full_desc));
+            updated_desc = full_desc;
+        } else {
+            new_lines.push(line.to_string());
+        }
+    }
+
+    let new_content = new_lines.join("\n") + "\n";
+    let temp_target = target_path.with_extension("tmp");
+
+    if let Ok(mut f) = File::create(&temp_target) {
+        if f.write_all(new_content.as_bytes()).is_ok() && f.sync_all().is_ok() {
+            drop(f);
+            if std::fs::rename(&temp_target, &target_path).is_ok() {
+                logger.log_info(&format!("[pid_wrap] 成功更新模块可变简介: {}\n", tag));
+            } else {
+                let _ = std::fs::remove_file(&temp_target);
+            }
+        }
+    }
+
+    if !updated_desc.is_empty() {
+        update_ksud_override_description(&updated_desc);
+    }
 }
 
 // 尝试利用 /proc/sys/kernel/pid_max 触发内核级瞬间回绕（毫秒级极速完成）
@@ -354,9 +452,11 @@ fn main() {
             "[pid_wrap] ✅ 极速通道成功！总耗时: {:.2} ms\n",
             ms
         ));
+        update_module_description("[✅正常]", &mut logger);
         return;
     }
 
     // 兜底方案：常规循环回绕
     fallback_wrap(init_pid, &mut logger, ts_start);
+    update_module_description("[✅正常 (vfork)]", &mut logger);
 }
