@@ -37,9 +37,13 @@ if [ -f "$prop_file" ]; then
     # ksud override.description 在管理器中按原样渲染，需转换为真实换行符
     real_desc=$(printf '%b' "$new_desc")
     export KSU_MODULE="soft_restart_fix"
-    if [ -x "/data/adb/ksu/bin/ksud" ]; then
-        /data/adb/ksu/bin/ksud module config set override.description "$real_desc" >/dev/null 2>&1 || true
-    elif command -v ksud >/dev/null 2>&1; then
+    for k in /data/adb/ksud /data/adb/ksu/bin/ksud /system/bin/ksud /system/xbin/ksud; do
+        if [ -x "$k" ]; then
+            "$k" module config set override.description "$real_desc" >/dev/null 2>&1 || true
+            break
+        fi
+    done
+    if command -v ksud >/dev/null 2>&1; then
         ksud module config set override.description "$real_desc" >/dev/null 2>&1 || true
     fi
 fi

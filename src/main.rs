@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 struct Logger {
@@ -213,24 +213,74 @@ fn format_updated_description(content: &str, tag: &str) -> (String, String) {
     (new_content, updated_desc)
 }
 
-fn update_ksud_override_description(full_desc: &str) {
-    let ksud_bin = if std::path::Path::new("/data/adb/ksu/bin/ksud").exists() {
-        "/data/adb/ksu/bin/ksud"
-    } else if std::path::Path::new("/system/bin/ksud").exists() {
-        "/system/bin/ksud"
-    } else {
-        "ksud"
-    };
+fn find_ksud_bin() -> Option<PathBuf> {
+    const CANDIDATES: &[&str] = &[
+        "/data/adb/ksud",
+        "/data/adb/ksu/bin/ksud",
+        "/system/bin/ksud",
+        "/system/xbin/ksud",
+    ];
 
+    for &path in CANDIDATES {
+        let p = Path::new(path);
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+    }
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let candidate = Path::new(dir).join("ksud");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn update_ksud_override_description(full_desc: &str, logger: &mut Logger) {
     // KernelSU 的 override.description 是原始字符串，不支持 Java properties 的 \n 转义，
     // 需将其替换为真实的换行符（0x0A），以确保在 KernelSU Manager 中正常换行渲染
     let unescaped_desc = unescape_description_for_override(full_desc);
-    let _ = std::process::Command::new(ksud_bin)
-        .env("KSU_MODULE", "soft_restart_fix")
-        .args(["module", "config", "set", "override.description", &unescaped_desc])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+
+    if let Some(ksud_path) = find_ksud_bin() {
+        let res = std::process::Command::new(&ksud_path)
+            .env("KSU_MODULE", "soft_restart_fix")
+            .args(["module", "config", "set", "override.description", &unescaped_desc])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        match res {
+            Ok(status) if status.success() => {
+                logger.log_info(&format!(
+                    "[pid_wrap] 成功通过 {} 更新 override.description\n",
+                    ksud_path.display()
+                ));
+            }
+            Ok(status) => {
+                logger.log_err(&format!(
+                    "[pid_wrap] {} 更新 override.description 异常退出: {:?}\n",
+                    ksud_path.display(),
+                    status.code()
+                ));
+            }
+            Err(e) => {
+                logger.log_err(&format!(
+                    "[pid_wrap] 调用 {} 失败: {}\n",
+                    ksud_path.display(),
+                    e
+                ));
+            }
+        }
+    } else {
+        logger.log_info("[pid_wrap] 未找到 ksud 命令，仅更新 module.prop\n");
+    }
 }
 
 fn update_module_description(tag: &str, logger: &mut Logger) {
@@ -261,7 +311,7 @@ fn update_module_description(tag: &str, logger: &mut Logger) {
     }
 
     if !updated_desc.is_empty() {
-        update_ksud_override_description(&updated_desc);
+        update_ksud_override_description(&updated_desc, logger);
     }
 }
 
@@ -526,5 +576,16 @@ mod tests {
             updated_desc_shell,
             "[✅正常 (Shell)] 在软重启前自动重置。\\n第二行"
         );
+    }
+
+    #[test]
+    fn test_candidate_ksud_paths() {
+        const CANDIDATES: &[&str] = &[
+            "/data/adb/ksud",
+            "/data/adb/ksu/bin/ksud",
+            "/system/bin/ksud",
+            "/system/xbin/ksud",
+        ];
+        assert_eq!(CANDIDATES[0], "/data/adb/ksud");
     }
 }
