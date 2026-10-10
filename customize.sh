@@ -43,4 +43,12 @@ done
 
 set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 
+# 清除可能残留的历史 override.description，使管理器恢复显示 module.prop 的初始未执行提示
+export KSU_MODULE="soft_restart_fix"
+if [ -x "/data/adb/ksu/bin/ksud" ]; then
+    /data/adb/ksu/bin/ksud module config delete override.description >/dev/null 2>&1 || true
+elif command -v ksud >/dev/null 2>&1; then
+    ksud module config delete override.description >/dev/null 2>&1 || true
+fi
+
 ui_print "- 安装完成"

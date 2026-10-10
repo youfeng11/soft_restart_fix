@@ -169,38 +169,11 @@ unsafe fn vfork_exit() -> libc::pid_t {
     pid
 }
 
-fn update_ksud_override_description(full_desc: &str) {
-    let ksud_path = if std::path::Path::new("/data/adb/ksu/bin/ksud").exists() {
-        Some("/data/adb/ksu/bin/ksud")
-    } else if std::path::Path::new("/system/bin/ksud").exists() {
-        Some("/system/bin/ksud")
-    } else {
-        None
-    };
-
-    if let Some(path) = ksud_path {
-        let _ = std::process::Command::new(path)
-            .env("KSU_MODULE", "soft_restart_fix")
-            .args(["module", "config", "set", "override.description", full_desc])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
+fn unescape_description_for_override(desc: &str) -> String {
+    desc.replace("\\r\\n", "\n").replace("\\n", "\n")
 }
 
-fn update_module_description(tag: &str, logger: &mut Logger) {
-    let module_dir = get_module_dir();
-    let prop_path = module_dir.join("module.prop");
-
-    let (content, target_path) = if let Ok(c) = std::fs::read_to_string(&prop_path) {
-        (c, prop_path)
-    } else if let Ok(c) = std::fs::read_to_string("module.prop") {
-        (c, PathBuf::from("module.prop"))
-    } else {
-        logger.log_info("[pid_wrap] 未找到 module.prop，跳过简介更新\n");
-        return;
-    };
-
+fn format_updated_description(content: &str, tag: &str) -> (String, String) {
     let mut new_lines = Vec::new();
     let mut updated_desc = String::new();
 
@@ -219,9 +192,13 @@ fn update_module_description(tag: &str, logger: &mut Logger) {
                 }
             }
 
-            // 去除前缀后的 \\n 字符对
-            while val.starts_with("\\n") {
-                val = val[2..].trim();
+            // 去除前缀后的 \\n 或物理换行符
+            while val.starts_with("\\n") || val.starts_with('\n') {
+                if val.starts_with("\\n") {
+                    val = val[2..].trim();
+                } else if val.starts_with('\n') {
+                    val = val[1..].trim();
+                }
             }
 
             let full_desc = format!("{} {}", tag, val);
@@ -233,6 +210,43 @@ fn update_module_description(tag: &str, logger: &mut Logger) {
     }
 
     let new_content = new_lines.join("\n") + "\n";
+    (new_content, updated_desc)
+}
+
+fn update_ksud_override_description(full_desc: &str) {
+    let ksud_bin = if std::path::Path::new("/data/adb/ksu/bin/ksud").exists() {
+        "/data/adb/ksu/bin/ksud"
+    } else if std::path::Path::new("/system/bin/ksud").exists() {
+        "/system/bin/ksud"
+    } else {
+        "ksud"
+    };
+
+    // KernelSU 的 override.description 是原始字符串，不支持 Java properties 的 \n 转义，
+    // 需将其替换为真实的换行符（0x0A），以确保在 KernelSU Manager 中正常换行渲染
+    let unescaped_desc = unescape_description_for_override(full_desc);
+    let _ = std::process::Command::new(ksud_bin)
+        .env("KSU_MODULE", "soft_restart_fix")
+        .args(["module", "config", "set", "override.description", &unescaped_desc])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+fn update_module_description(tag: &str, logger: &mut Logger) {
+    let module_dir = get_module_dir();
+    let prop_path = module_dir.join("module.prop");
+
+    let (content, target_path) = if let Ok(c) = std::fs::read_to_string(&prop_path) {
+        (c, prop_path)
+    } else if let Ok(c) = std::fs::read_to_string("module.prop") {
+        (c, PathBuf::from("module.prop"))
+    } else {
+        logger.log_info("[pid_wrap] 未找到 module.prop，跳过简介更新\n");
+        return;
+    };
+
+    let (new_content, updated_desc) = format_updated_description(&content, tag);
     let temp_target = target_path.with_extension("tmp");
 
     if let Ok(mut f) = File::create(&temp_target) {
@@ -459,4 +473,58 @@ fn main() {
     // 兜底方案：常规循环回绕
     fallback_wrap(init_pid, &mut logger, ts_start);
     update_module_description("[✅正常 (vfork)]", &mut logger);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unescape_description_for_override() {
+        let raw = "[✅正常] 第一行\\n第二行\\r\\n第三行";
+        let unescaped = unescape_description_for_override(raw);
+        assert_eq!(unescaped, "[✅正常] 第一行\n第二行\n第三行");
+        assert!(!unescaped.contains("\\n"));
+        assert!(!unescaped.contains("\\r\\n"));
+    }
+
+    #[test]
+    fn test_format_updated_description_initial() {
+        let prop = "id=soft_restart_fix\nversion=v1.2.0\ndescription=[⚠️未执行，请执行软重启] 在软重启前自动重置内核PID计数器。\\n核心采用 Rust 实现。\\n提高效率！\nupdateJson=https://example.com/update.json\n";
+        let (new_prop, updated_desc) = format_updated_description(prop, "[✅正常]");
+        assert!(new_prop.contains("description=[✅正常] 在软重启前自动重置内核PID计数器。\\n核心采用 Rust 实现。\\n提高效率！\n"));
+        assert!(!new_prop.contains("[⚠️未执行"));
+        assert_eq!(
+            updated_desc,
+            "[✅正常] 在软重启前自动重置内核PID计数器。\\n核心采用 Rust 实现。\\n提高效率！"
+        );
+
+        let override_text = unescape_description_for_override(&updated_desc);
+        assert_eq!(
+            override_text,
+            "[✅正常] 在软重启前自动重置内核PID计数器。\n核心采用 Rust 实现。\n提高效率！"
+        );
+    }
+
+    #[test]
+    fn test_format_updated_description_idempotent() {
+        let prop = "id=soft_restart_fix\ndescription=[✅正常] 在软重启前自动重置。\\n第二行\n";
+        let (new_prop, updated_desc) = format_updated_description(prop, "[✅正常 (vfork)]");
+        assert!(new_prop.contains("description=[✅正常 (vfork)] 在软重启前自动重置。\\n第二行\n"));
+        assert!(!new_prop.contains("[✅正常] 在软重启前"));
+        assert_eq!(
+            updated_desc,
+            "[✅正常 (vfork)] 在软重启前自动重置。\\n第二行"
+        );
+
+        // 再用 Shell 模式更新
+        let (new_prop_shell, updated_desc_shell) =
+            format_updated_description(&new_prop, "[✅正常 (Shell)]");
+        assert!(new_prop_shell.contains("description=[✅正常 (Shell)] 在软重启前自动重置。\\n第二行\n"));
+        assert!(!new_prop_shell.contains("[✅正常 (vfork)]"));
+        assert_eq!(
+            updated_desc_shell,
+            "[✅正常 (Shell)] 在软重启前自动重置。\\n第二行"
+        );
+    }
 }

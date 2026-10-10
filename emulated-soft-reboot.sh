@@ -34,10 +34,12 @@ if [ -f "$prop_file" ]; then
     escaped_desc=$(printf '%s\n' "$new_desc" | sed 's/\\/\\\\/g')
     sed -i "s|^description=.*|description=${escaped_desc}|" "$prop_file" 2>/dev/null || true
 
+    # ksud override.description 在管理器中按原样渲染，需转换为真实换行符
+    real_desc=$(printf '%b' "$new_desc")
     export KSU_MODULE="soft_restart_fix"
     if [ -x "/data/adb/ksu/bin/ksud" ]; then
-        /data/adb/ksu/bin/ksud module config set override.description "$new_desc" >/dev/null 2>&1 || true
+        /data/adb/ksu/bin/ksud module config set override.description "$real_desc" >/dev/null 2>&1 || true
     elif command -v ksud >/dev/null 2>&1; then
-        ksud module config set override.description "$new_desc" >/dev/null 2>&1 || true
+        ksud module config set override.description "$real_desc" >/dev/null 2>&1 || true
     fi
 fi
