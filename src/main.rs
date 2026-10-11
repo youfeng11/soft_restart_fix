@@ -1,5 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -18,7 +20,6 @@ fn get_module_dir() -> PathBuf {
             if module_dir.join("module.prop").exists() {
                 return module_dir.to_path_buf();
             }
-            return module_dir.to_path_buf();
         }
     }
 
@@ -80,7 +81,6 @@ impl Logger {
         if let Some(file) = &mut self.file {
             let _ = file.write_all(s.as_bytes());
             let _ = file.flush();
-            let _ = file.sync_all();
         }
     }
 
@@ -141,9 +141,10 @@ impl PidMaxGuard {
         if !self.restored {
             if let Some(mut file) = self.file.take() {
                 let _ = file.seek(SeekFrom::Start(0));
-                let _ = file.write_all(&self.orig_content);
+                if let Err(e) = file.write_all(&self.orig_content) {
+                    eprintln!("[pid_wrap] 恢复 pid_max 失败: {}", e);
+                }
                 let _ = file.flush();
-                let _ = file.sync_all();
             }
             unsafe {
                 libc::sigprocmask(libc::SIG_SETMASK, &self.old_sigs, std::ptr::null_mut());
@@ -192,9 +193,17 @@ fn format_updated_description(content: &str, tag: &str) -> (String, String) {
                 }
             }
 
-            // 去除前缀后的 \\n 或物理换行符
-            while val.starts_with("\\n") || val.starts_with('\n') {
-                if val.starts_with("\\n") {
+            // 去除前缀后的换行符（支持 \r\n, \n, \\r\\n, \\n）
+            while val.starts_with("\\r\\n")
+                || val.starts_with("\\n")
+                || val.starts_with("\r\n")
+                || val.starts_with('\n')
+            {
+                if val.starts_with("\\r\\n") {
+                    val = val[4..].trim();
+                } else if val.starts_with("\\n") {
+                    val = val[2..].trim();
+                } else if val.starts_with("\r\n") {
                     val = val[2..].trim();
                 } else if val.starts_with('\n') {
                     val = val[1..].trim();
@@ -213,6 +222,19 @@ fn format_updated_description(content: &str, tag: &str) -> (String, String) {
     (new_content, updated_desc)
 }
 
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::fs::metadata(path)
+            .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
 fn find_ksud_bin() -> Option<PathBuf> {
     const CANDIDATES: &[&str] = &[
         "/data/adb/ksud",
@@ -223,7 +245,7 @@ fn find_ksud_bin() -> Option<PathBuf> {
 
     for &path in CANDIDATES {
         let p = Path::new(path);
-        if p.exists() {
+        if is_executable(p) {
             return Some(p.to_path_buf());
         }
     }
@@ -234,7 +256,7 @@ fn find_ksud_bin() -> Option<PathBuf> {
                 continue;
             }
             let candidate = Path::new(dir).join("ksud");
-            if candidate.exists() {
+            if is_executable(&candidate) {
                 return Some(candidate);
             }
         }
@@ -299,15 +321,26 @@ fn update_module_description(tag: &str, logger: &mut Logger) {
     let (new_content, updated_desc) = format_updated_description(&content, tag);
     let temp_target = target_path.with_extension("tmp");
 
+    let mut write_success = false;
     if let Ok(mut f) = File::create(&temp_target) {
-        if f.write_all(new_content.as_bytes()).is_ok() && f.sync_all().is_ok() {
-            drop(f);
-            if std::fs::rename(&temp_target, &target_path).is_ok() {
-                logger.log_info(&format!("[pid_wrap] 成功更新模块可变简介: {}\n", tag));
-            } else {
-                let _ = std::fs::remove_file(&temp_target);
-            }
+        if f.write_all(new_content.as_bytes()).is_ok()
+            && f.flush().is_ok()
+            && f.sync_all().is_ok()
+        {
+            write_success = true;
         }
+    }
+
+    if write_success {
+        if std::fs::rename(&temp_target, &target_path).is_ok() {
+            logger.log_info(&format!("[pid_wrap] 成功更新模块可变简介: {}\n", tag));
+        } else {
+            let _ = std::fs::remove_file(&temp_target);
+            logger.log_err("[pid_wrap] 重命名 module.tmp 失败\n");
+        }
+    } else {
+        let _ = std::fs::remove_file(&temp_target);
+        logger.log_err("[pid_wrap] 写入 module.tmp 失败\n");
     }
 
     if !updated_desc.is_empty() {
@@ -362,7 +395,7 @@ fn try_fast_wrap(logger: &mut Logger) -> bool {
         return false;
     }
 
-    let cur = unsafe { libc::getpid() } as i64;
+    let cur = std::process::id() as i64;
     let mut temp_max = cur + 64;
 
     logger.log_info(&format!(
@@ -428,9 +461,7 @@ fn try_fast_wrap(logger: &mut Logger) -> bool {
         attempts += 1;
         p = unsafe { vfork_exit() };
         if p < 0 {
-            unsafe {
-                libc::sched_yield();
-            }
+            std::thread::yield_now();
             continue;
         }
         if p < last {
@@ -459,22 +490,27 @@ fn try_fast_wrap(logger: &mut Logger) -> bool {
 }
 
 // 兜底方案：常规循环回绕（回绕即停）
-fn fallback_wrap(init_pid: libc::pid_t, logger: &mut Logger, ts_start: Instant) {
+fn fallback_wrap(init_pid: libc::pid_t, logger: &mut Logger, ts_start: Instant) -> bool {
     logger.log_info("[pid_wrap] ⚠️ 极速通道不可用，降级进入常规循环回绕 (逐个遍历消耗 PID，单核运行中)...\n");
 
     let mut last = init_pid;
     let mut fork_count: u64 = 0;
+    let mut consecutive_failures: u32 = 0;
     let final_pid: libc::pid_t;
 
     loop {
         fork_count += 1;
         let p = unsafe { vfork_exit() };
         if p < 0 {
-            unsafe {
-                libc::sched_yield();
+            consecutive_failures += 1;
+            if consecutive_failures >= 100 {
+                logger.log_err("[pid_wrap] 连续 vfork 失败达到 100 次，系统资源受限，中止降级回绕\n");
+                return false;
             }
+            std::thread::yield_now();
             continue;
         }
+        consecutive_failures = 0;
         if p < last {
             // 一旦回绕到低位，立刻退出！
             final_pid = p;
@@ -491,13 +527,14 @@ fn fallback_wrap(init_pid: libc::pid_t, logger: &mut Logger, ts_start: Instant) 
         "[pid_wrap] 降级通道完成: 共遍历 {} 次 fork, 最终重置到低位 PID={}, 总耗时: {:.2} ms ({:.2} s)\n",
         fork_count, final_pid, ms, s
     ));
+    true
 }
 
 fn main() {
     let mut logger = Logger::init();
     let ts_start = Instant::now();
 
-    let init_pid = unsafe { libc::getpid() };
+    let init_pid = std::process::id() as libc::pid_t;
     logger.log_info(&format!(
         "[pid_wrap] 开始执行 PID 修复, 当前进程 PID={}\n",
         init_pid
@@ -505,11 +542,17 @@ fn main() {
 
     unsafe {
         libc::nice(-20);
+        // PID 遍历期间忽略 SIGCHLD，防止大量产生僵尸进程
         libc::signal(libc::SIGCHLD, libc::SIG_IGN);
     }
 
     // 优先尝试基于 pid_max 的极速重置（毫秒级）
     if try_fast_wrap(&mut logger) {
+        // 回绕完成，恢复 SIGCHLD 默认行为，确保后续 Command::status() 可正常 waitpid
+        unsafe {
+            libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        }
+
         let elapsed = ts_start.elapsed();
         let ms = elapsed.as_secs_f64() * 1000.0;
         logger.log_info(&format!(
@@ -521,8 +564,19 @@ fn main() {
     }
 
     // 兜底方案：常规循环回绕
-    fallback_wrap(init_pid, &mut logger, ts_start);
-    update_module_description("[✅正常 (vfork)]", &mut logger);
+    let fallback_ok = fallback_wrap(init_pid, &mut logger, ts_start);
+
+    // 回绕完成，恢复 SIGCHLD 默认行为
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+    }
+
+    if fallback_ok {
+        update_module_description("[✅正常 (vfork)]", &mut logger);
+    } else {
+        logger.log_err("[pid_wrap] ❌ PID 回绕失败，未更新模块简介状态\n");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -576,6 +630,14 @@ mod tests {
             updated_desc_shell,
             "[✅正常 (Shell)] 在软重启前自动重置。\\n第二行"
         );
+    }
+
+    #[test]
+    fn test_format_updated_description_crlf_stripping() {
+        let prop = "description=[⚠️未执行]\\r\\n第一行\\n第二行\n";
+        let (new_prop, updated_desc) = format_updated_description(prop, "[✅正常]");
+        assert!(new_prop.contains("description=[✅正常] 第一行\\n第二行"));
+        assert_eq!(updated_desc, "[✅正常] 第一行\\n第二行");
     }
 
     #[test]
