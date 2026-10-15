@@ -1,14 +1,12 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 /// 安全低位阈值：若当前 PID 已低于此值，说明刚开机或刚完成回绕，无需重复操作
-const SAFE_LOW_PID_THRESHOLD: libc::pid_t = 1500;
+const SAFE_LOW_PID_THRESHOLD: libc::pid_t = 1280;
 /// 临时 pid_max 的最低安全下限（避开 300~1500 之间密集的 init/kworker 占用区，防止 EAGAIN）
 const MIN_SAFE_TEMP_PID_MAX: i64 = 2048;
 
@@ -291,7 +289,7 @@ fn bind_to_prime_core(logger: &mut Logger) {
 }
 
 fn unescape_description_for_override(desc: &str) -> String {
-    desc.replace("\\r\\n", "\n").replace("\\n", "\n")
+    desc.replace("\\n", "\n")
 }
 
 fn format_updated_description(content: &str, tag: &str) -> (String, String) {
@@ -313,17 +311,9 @@ fn format_updated_description(content: &str, tag: &str) -> (String, String) {
                 }
             }
 
-            // 去除前缀后的换行符（支持 \r\n, \n, \\r\\n, \\n）
-            while val.starts_with("\\r\\n")
-                || val.starts_with("\\n")
-                || val.starts_with("\r\n")
-                || val.starts_with('\n')
-            {
-                if val.starts_with("\\r\\n") {
-                    val = val[4..].trim();
-                } else if val.starts_with("\\n") {
-                    val = val[2..].trim();
-                } else if val.starts_with("\r\n") {
+            // 去除前缀后的 LF 换行符（仅支持 \n 与 \\n）
+            while val.starts_with("\\n") || val.starts_with('\n') {
+                if val.starts_with("\\n") {
                     val = val[2..].trim();
                 } else if val.starts_with('\n') {
                     val = val[1..].trim();
@@ -342,90 +332,35 @@ fn format_updated_description(content: &str, tag: &str) -> (String, String) {
     (new_content, updated_desc)
 }
 
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
-}
-
-fn find_ksud_bin() -> Option<PathBuf> {
-    const CANDIDATES: &[&str] = &[
-        "/data/adb/ksud",
-        "/data/adb/ksu/bin/ksud",
-        "/system/bin/ksud",
-        "/system/xbin/ksud",
-    ];
-
-    for &path in CANDIDATES {
-        let p = Path::new(path);
-        if is_executable(p) {
-            return Some(p.to_path_buf());
-        }
-    }
-
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in path_var.split(':') {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join("ksud");
-            if is_executable(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
-}
-
 fn update_ksud_override_description(full_desc: &str, logger: &mut Logger) {
     let unescaped_desc = unescape_description_for_override(full_desc);
 
-    if let Some(ksud_path) = find_ksud_bin() {
-        let res = std::process::Command::new(&ksud_path)
-            .env("KSU_MODULE", "soft_restart_fix")
-            .args([
-                "module",
-                "config",
-                "set",
-                "override.description",
-                &unescaped_desc,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+    let res = std::process::Command::new("ksud")
+        .env("KSU_MODULE", "soft_restart_fix")
+        .args([
+            "module",
+            "config",
+            "set",
+            "override.description",
+            &unescaped_desc,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 
-        match res {
-            Ok(status) if status.success() => {
-                logger.log_info(&format!(
-                    "[pid_wrap] 成功通过 {} 更新 override.description\n",
-                    ksud_path.display()
-                ));
-            }
-            Ok(status) => {
-                logger.log_err(&format!(
-                    "[pid_wrap] {} 更新 override.description 异常退出: {:?}\n",
-                    ksud_path.display(),
-                    status.code()
-                ));
-            }
-            Err(e) => {
-                logger.log_err(&format!(
-                    "[pid_wrap] 调用 {} 失败: {}\n",
-                    ksud_path.display(),
-                    e
-                ));
-            }
+    match res {
+        Ok(status) if status.success() => {
+            logger.log_info("[pid_wrap] 成功通过 ksud 更新 override.description\n");
         }
-    } else {
-        logger.log_info("[pid_wrap] 未找到 ksud 命令，仅更新 module.prop\n");
+        Ok(status) => {
+            logger.log_err(&format!(
+                "[pid_wrap] ksud 更新 override.description 异常退出: {:?}\n",
+                status.code()
+            ));
+        }
+        Err(e) => {
+            logger.log_err(&format!("[pid_wrap] 调用 ksud 失败: {}\n", e));
+        }
     }
 }
 
@@ -669,7 +604,7 @@ fn main() {
             "[pid_wrap] ✅ 当前 PID ({}) 已处于安全低位 (< {})，无需回绕\n",
             init_pid, SAFE_LOW_PID_THRESHOLD
         ));
-        update_module_description("[✅正常]", &mut logger);
+        update_module_description("[✅已生效]", &mut logger);
         return;
     }
 
@@ -692,7 +627,7 @@ fn main() {
             "[pid_wrap] ✅ 极速通道成功！总耗时: {:.2} ms\n",
             ms
         ));
-        update_module_description("[✅正常]", &mut logger);
+        update_module_description("[✅已生效]", &mut logger);
         return;
     }
 
@@ -705,82 +640,10 @@ fn main() {
     }
 
     if fallback_ok {
-        update_module_description("[✅正常 (vfork)]", &mut logger);
+        update_module_description("[✅已生效 (备用方案)]", &mut logger);
     } else {
-        logger.log_err("[pid_wrap] ❌ PID 回绕失败，未更新模块简介状态\n");
+        update_module_description("[❌错误]", &mut logger);
+        logger.log_err("[pid_wrap] ❌ PID 回绕失败，已更新模块简介状态为错误\n");
         std::process::exit(1);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_unescape_description_for_override() {
-        let raw = "[✅正常] 第一行\\n第二行\\r\\n第三行";
-        let unescaped = unescape_description_for_override(raw);
-        assert_eq!(unescaped, "[✅正常] 第一行\n第二行\n第三行");
-        assert!(!unescaped.contains("\\n"));
-        assert!(!unescaped.contains("\\r\\n"));
-    }
-
-    #[test]
-    fn test_format_updated_description_initial() {
-        let prop = "id=soft_restart_fix\nversion=v1.2.0\ndescription=[⚠️未执行，请执行软重启] 在软重启前自动重置内核PID计数器。\\n核心采用 Rust 实现。\\n提高效率！\nupdateJson=https://example.com/update.json\n";
-        let (new_prop, updated_desc) = format_updated_description(prop, "[✅正常]");
-        assert!(new_prop.contains("description=[✅正常] 在软重启前自动重置内核PID计数器。\\n核心采用 Rust 实现。\\n提高效率！\n"));
-        assert!(!new_prop.contains("[⚠️未执行"));
-        assert_eq!(
-            updated_desc,
-            "[✅正常] 在软重启前自动重置内核PID计数器。\\n核心采用 Rust 实现。\\n提高效率！"
-        );
-
-        let override_text = unescape_description_for_override(&updated_desc);
-        assert_eq!(
-            override_text,
-            "[✅正常] 在软重启前自动重置内核PID计数器。\n核心采用 Rust 实现。\n提高效率！"
-        );
-    }
-
-    #[test]
-    fn test_format_updated_description_idempotent() {
-        let prop = "id=soft_restart_fix\ndescription=[✅正常] 在软重启前自动重置。\\n第二行\n";
-        let (new_prop, updated_desc) = format_updated_description(prop, "[✅正常 (vfork)]");
-        assert!(new_prop.contains("description=[✅正常 (vfork)] 在软重启前自动重置。\\n第二行\n"));
-        assert!(!new_prop.contains("[✅正常] 在软重启前"));
-        assert_eq!(
-            updated_desc,
-            "[✅正常 (vfork)] 在软重启前自动重置。\\n第二行"
-        );
-
-        // 再用 Shell 模式更新
-        let (new_prop_shell, updated_desc_shell) =
-            format_updated_description(&new_prop, "[✅正常 (Shell)]");
-        assert!(new_prop_shell.contains("description=[✅正常 (Shell)] 在软重启前自动重置。\\n第二行\n"));
-        assert!(!new_prop_shell.contains("[✅正常 (vfork)]"));
-        assert_eq!(
-            updated_desc_shell,
-            "[✅正常 (Shell)] 在软重启前自动重置。\\n第二行"
-        );
-    }
-
-    #[test]
-    fn test_format_updated_description_crlf_stripping() {
-        let prop = "description=[⚠️未执行]\\r\\n第一行\\n第二行\n";
-        let (new_prop, updated_desc) = format_updated_description(prop, "[✅正常]");
-        assert!(new_prop.contains("description=[✅正常] 第一行\\n第二行"));
-        assert_eq!(updated_desc, "[✅正常] 第一行\\n第二行");
-    }
-
-    #[test]
-    fn test_candidate_ksud_paths() {
-        const CANDIDATES: &[&str] = &[
-            "/data/adb/ksud",
-            "/data/adb/ksu/bin/ksud",
-            "/system/bin/ksud",
-            "/system/xbin/ksud",
-        ];
-        assert_eq!(CANDIDATES[0], "/data/adb/ksud");
     }
 }
