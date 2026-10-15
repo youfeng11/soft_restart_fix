@@ -1,9 +1,16 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+/// 安全低位阈值：若当前 PID 已低于此值，说明刚开机或刚完成回绕，无需重复操作
+const SAFE_LOW_PID_THRESHOLD: libc::pid_t = 1500;
+/// 临时 pid_max 的最低安全下限（避开 300~1500 之间密集的 init/kworker 占用区，防止 EAGAIN）
+const MIN_SAFE_TEMP_PID_MAX: i64 = 2048;
 
 struct Logger {
     file: Option<File>,
@@ -119,6 +126,30 @@ fn get_current_time_str() -> String {
     "unknown time".to_string()
 }
 
+/// 使用 pwrite 系统调用从偏移量 0 原子写入 procfs 节点，避免 seek + write 分离引发的状态问题
+#[cfg(unix)]
+fn pwrite_all_at_zero(file: &File, buf: &[u8]) -> std::io::Result<()> {
+    let fd = file.as_raw_fd();
+    let ret = unsafe {
+        libc::pwrite(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+            0,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else if (ret as usize) != buf.len() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "partial pwrite to procfs",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 // RAII 保护守卫：确保在修改 pid_max 后无论发生何种情况，都能 100% 恢复原始 pid_max 并解除信号屏蔽
 struct PidMaxGuard {
     file: Option<File>,
@@ -139,12 +170,10 @@ impl PidMaxGuard {
 
     fn restore(&mut self) {
         if !self.restored {
-            if let Some(mut file) = self.file.take() {
-                let _ = file.seek(SeekFrom::Start(0));
-                if let Err(e) = file.write_all(&self.orig_content) {
+            if let Some(file) = self.file.take() {
+                if let Err(e) = pwrite_all_at_zero(&file, &self.orig_content) {
                     eprintln!("[pid_wrap] 恢复 pid_max 失败: {}", e);
                 }
-                let _ = file.flush();
             }
             unsafe {
                 libc::sigprocmask(libc::SIG_SETMASK, &self.old_sigs, std::ptr::null_mut());
@@ -160,14 +189,105 @@ impl Drop for PidMaxGuard {
     }
 }
 
+/// 零栈触碰的极速 vfork + exit 实现：
+/// 避免在 Rust 函数中直接调用 libc::vfork() 导致父子进程共享栈帧引发未定义行为 (UB)。
 #[inline(never)]
-#[allow(deprecated)]
-unsafe fn vfork_exit() -> libc::pid_t {
-    let pid = libc::vfork();
-    if pid == 0 {
-        libc::_exit(0);
+unsafe fn fast_vfork_exit() -> libc::pid_t {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ret: isize;
+        // CLONE_VM (0x0100) | CLONE_VFORK (0x4000) | SIGCHLD (17) = 0x4111
+        core::arch::asm!(
+            "mov x0, #0x4111",
+            "mov x1, xzr",
+            "mov x2, xzr",
+            "mov x3, xzr",
+            "mov x4, xzr",
+            "mov x8, #220", // __NR_clone on aarch64
+            "svc #0",
+            "cbnz x0, 2f",  // 若 x0 != 0 (父进程或出错)，跳转至标签 2 返回
+            "mov x0, xzr",  // 子进程：全程不触碰任何栈内存，直接调 SYS_exit(0)
+            "mov x8, #93",  // __NR_exit on aarch64
+            "svc #0",
+            "2:",
+            out("x0") ret,
+            out("x1") _,
+            out("x2") _,
+            out("x3") _,
+            out("x4") _,
+            out("x8") _,
+            options(nostack)
+        );
+        if ret < 0 {
+            -1
+        } else {
+            ret as libc::pid_t
+        }
     }
-    pid
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let ret: isize;
+        // CLONE_VM (0x0100) | CLONE_VFORK (0x4000) | SIGCHLD (17) = 0x4111
+        core::arch::asm!(
+            "mov edi, 0x4111",
+            "xor esi, esi",
+            "xor edx, edx",
+            "xor r10d, r10d",
+            "xor r8d, r8d",
+            "mov eax, 56",  // __NR_clone on x86_64
+            "syscall",
+            "test rax, rax",
+            "jnz 2f",       // 父进程或出错则跳转
+            "xor edi, edi", // 子进程：直接调 SYS_exit(0)
+            "mov eax, 60",  // __NR_exit on x86_64
+            "syscall",
+            "2:",
+            out("rax") ret,
+            out("rdi") _,
+            out("rsi") _,
+            out("rdx") _,
+            out("r10") _,
+            out("r8") _,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack)
+        );
+        if ret < 0 {
+            -1
+        } else {
+            ret as libc::pid_t
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        // 其他架构兜底：直接通过 syscall 调用轻量级 clone(SIGCHLD)，绕过 libc pthread_atfork 开销且不共享栈
+        let pid = libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_long, 0, 0, 0, 0) as libc::pid_t;
+        if pid == 0 {
+            libc::_exit(0);
+        }
+        pid
+    }
+}
+
+/// 将当前进程绑定至编号最大的 CPU 核心（在 Android big.LITTLE 架构下通常为 Prime 超大核）
+fn bind_to_prime_core(logger: &mut Logger) {
+    #[cfg(unix)]
+    unsafe {
+        let num_cpus = libc::sysconf(libc::_SC_NPROCESSORS_ONLN);
+        if num_cpus > 1 {
+            let prime_cpu = (num_cpus - 1) as usize;
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(prime_cpu, &mut set);
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0 {
+                logger.log_info(&format!(
+                    "[pid_wrap] 已将进程绑定至大核 CPU{} 以加速遍历\n",
+                    prime_cpu
+                ));
+            }
+        }
+    }
 }
 
 fn unescape_description_for_override(desc: &str) -> String {
@@ -266,14 +386,18 @@ fn find_ksud_bin() -> Option<PathBuf> {
 }
 
 fn update_ksud_override_description(full_desc: &str, logger: &mut Logger) {
-    // KernelSU 的 override.description 是原始字符串，不支持 Java properties 的 \n 转义，
-    // 需将其替换为真实的换行符（0x0A），以确保在 KernelSU Manager 中正常换行渲染
     let unescaped_desc = unescape_description_for_override(full_desc);
 
     if let Some(ksud_path) = find_ksud_bin() {
         let res = std::process::Command::new(&ksud_path)
             .env("KSU_MODULE", "soft_restart_fix")
-            .args(["module", "config", "set", "override.description", &unescaped_desc])
+            .args([
+                "module",
+                "config",
+                "set",
+                "override.description",
+                &unescaped_desc,
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -349,7 +473,7 @@ fn update_module_description(tag: &str, logger: &mut Logger) {
 }
 
 // 尝试利用 /proc/sys/kernel/pid_max 触发内核级瞬间回绕（毫秒级极速完成）
-fn try_fast_wrap(logger: &mut Logger) -> bool {
+fn try_fast_wrap(cur_pid: libc::pid_t, logger: &mut Logger) -> bool {
     let mut file = match OpenOptions::new()
         .read(true)
         .write(true)
@@ -395,28 +519,13 @@ fn try_fast_wrap(logger: &mut Logger) -> bool {
         return false;
     }
 
-    let cur = std::process::id() as i64;
-    let mut temp_max = cur + 64;
+    let cur = cur_pid as i64;
+    let mut temp_max = (cur + 64).max(MIN_SAFE_TEMP_PID_MAX);
 
     logger.log_info(&format!(
         "[pid_wrap] 当前进程 PID={}, 系统原始 pid_max={}\n",
         cur, orig_pid_max
     ));
-
-    // 若当前 PID 加上余量已接近甚至超过原 pid_max，说明即将自然回绕，无需缩小 pid_max
-    if temp_max >= orig_pid_max {
-        logger.log_info(&format!(
-            "[pid_wrap] 当前 PID 接近上限 ({})，无需修改参数，将自然回绕\n",
-            orig_pid_max
-        ));
-        return false;
-    }
-
-    if temp_max < 302 {
-        temp_max = 302;
-    }
-
-    let new_content = format!("{}\n", temp_max);
 
     // 阻塞所有信号，确保在微小的修改窗口期间不被中断，原值必定被还原
     let mut all_sigs = std::mem::MaybeUninit::uninit();
@@ -427,43 +536,55 @@ fn try_fast_wrap(logger: &mut Logger) -> bool {
     }
     let old_sigs = unsafe { old_sigs.assume_init() };
 
-    // 创建 RAII 守卫：无论后续发生什么，离开作用域前必定还原原始 pid_max 和信号屏蔽
     let mut guard = PidMaxGuard::new(file, orig_buf.into_bytes(), old_sigs);
 
-    if let Some(f) = &mut guard.file {
-        if f.seek(SeekFrom::Start(0)).is_err()
-            || f.write_all(new_content.as_bytes()).is_err()
-            || f.flush().is_err()
-        {
-            logger.log_err(&format!(
-                "[pid_wrap] 写入临时 pid_max={} 失败\n",
-                temp_max
-            ));
-            guard.restore();
-            return false;
+    // 若 temp_max < orig_pid_max，则临时收缩 pid_max；若已接近上限，则不改写文件直接进行自然回绕
+    if temp_max < orig_pid_max {
+        let new_content = format!("{}\n", temp_max);
+        if let Some(f) = &guard.file {
+            if let Err(e) = pwrite_all_at_zero(f, new_content.as_bytes()) {
+                logger.log_err(&format!(
+                    "[pid_wrap] 写入临时 pid_max={} 失败: {}\n",
+                    temp_max, e
+                ));
+                guard.restore();
+                return false;
+            }
         }
+        logger.log_info(&format!(
+            "[pid_wrap] 极速通道: 临时设置 pid_max={} 成功，正在触发内核瞬间回绕...\n",
+            temp_max
+        ));
+    } else {
+        temp_max = orig_pid_max;
+        logger.log_info(&format!(
+            "[pid_wrap] 当前 PID 已接近系统上限 ({})，无需收缩参数，直接执行极速自然回绕...\n",
+            orig_pid_max
+        ));
     }
 
-    logger.log_info(&format!(
-        "[pid_wrap] 极速通道: 临时设置 pid_max={} 成功，正在触发内核瞬间回绕...\n",
-        temp_max
-    ));
-
-    // 快速触发内核回绕（由于 pid_max 临时设在当前 PID 附近，数次 vfork 即触发内核重置）
-    let mut last = cur as libc::pid_t;
-    let mut p = cur as libc::pid_t;
+    // 快速触发内核回绕
+    let mut last = cur_pid;
+    let mut p = cur_pid;
     let mut wrapped = false;
     let mut attempts = 0;
-    let mut max_attempts = 1000;
+    let mut consecutive_eagain = 0;
+    let max_attempts = 1000;
 
-    while max_attempts > 0 {
-        max_attempts -= 1;
+    while attempts < max_attempts {
         attempts += 1;
-        p = unsafe { vfork_exit() };
+        p = unsafe { fast_vfork_exit() };
         if p < 0 {
+            consecutive_eagain += 1;
+            // 若连续 10 次无法分配 PID，说明 [300, temp_max) 区间被占满，立即中止以防死转
+            if consecutive_eagain >= 10 {
+                logger.log_err("[pid_wrap] 极速通道连续遇到 EAGAIN，低位区间可能饱和，提前退出\n");
+                break;
+            }
             std::thread::yield_now();
             continue;
         }
+        consecutive_eagain = 0;
         if p < last {
             wrapped = true;
             break;
@@ -476,14 +597,14 @@ fn try_fast_wrap(logger: &mut Logger) -> bool {
 
     if !wrapped {
         logger.log_err(&format!(
-            "[pid_wrap] 尝试 {} 次 fork 未检测到回绕，回退到常规模式\n",
+            "[pid_wrap] 尝试 {} 次 clone 未检测到回绕，回退到常规模式\n",
             attempts
         ));
         return false;
     }
 
     logger.log_info(&format!(
-        "[pid_wrap] 内核极速回绕成功！仅历经 {} 次 fork，PID 已重置到低位: {} (已恢复原始 pid_max={})\n",
+        "[pid_wrap] 内核极速回绕成功！仅历经 {} 次 clone，PID 已重置到低位: {} (已确保 pid_max={})\n",
         attempts, p, orig_pid_max
     ));
     true
@@ -491,7 +612,10 @@ fn try_fast_wrap(logger: &mut Logger) -> bool {
 
 // 兜底方案：常规循环回绕（回绕即停）
 fn fallback_wrap(init_pid: libc::pid_t, logger: &mut Logger, ts_start: Instant) -> bool {
-    logger.log_info("[pid_wrap] ⚠️ 极速通道不可用，降级进入常规循环回绕 (逐个遍历消耗 PID，单核运行中)...\n");
+    logger.log_info("[pid_wrap] ⚠️ 极速通道不可用，降级进入常规循环回绕 (逐个遍历消耗 PID)...\n");
+
+    // 绑定至超大核，减少跨核缓存失效
+    bind_to_prime_core(logger);
 
     let mut last = init_pid;
     let mut fork_count: u64 = 0;
@@ -500,11 +624,11 @@ fn fallback_wrap(init_pid: libc::pid_t, logger: &mut Logger, ts_start: Instant) 
 
     loop {
         fork_count += 1;
-        let p = unsafe { vfork_exit() };
+        let p = unsafe { fast_vfork_exit() };
         if p < 0 {
             consecutive_failures += 1;
             if consecutive_failures >= 100 {
-                logger.log_err("[pid_wrap] 连续 vfork 失败达到 100 次，系统资源受限，中止降级回绕\n");
+                logger.log_err("[pid_wrap] 连续 clone 失败达到 100 次，系统资源受限，中止降级回绕\n");
                 return false;
             }
             std::thread::yield_now();
@@ -524,7 +648,7 @@ fn fallback_wrap(init_pid: libc::pid_t, logger: &mut Logger, ts_start: Instant) 
     let s = ms / 1000.0;
 
     logger.log_info(&format!(
-        "[pid_wrap] 降级通道完成: 共遍历 {} 次 fork, 最终重置到低位 PID={}, 总耗时: {:.2} ms ({:.2} s)\n",
+        "[pid_wrap] 降级通道完成: 共遍历 {} 次 clone, 最终重置到低位 PID={}, 总耗时: {:.2} ms ({:.2} s)\n",
         fork_count, final_pid, ms, s
     ));
     true
@@ -540,14 +664,24 @@ fn main() {
         init_pid
     ));
 
+    // 若当前 PID 本身已经处于安全低位，无需折腾内核，直接标记成功
+    if init_pid < SAFE_LOW_PID_THRESHOLD {
+        logger.log_info(&format!(
+            "[pid_wrap] ✅ 当前 PID ({}) 已处于安全低位 (< {})，无需回绕\n",
+            init_pid, SAFE_LOW_PID_THRESHOLD
+        ));
+        update_module_description("[✅正常]", &mut logger);
+        return;
+    }
+
     unsafe {
         libc::nice(-20);
-        // PID 遍历期间忽略 SIGCHLD，防止大量产生僵尸进程
+        // PID 遍历期间忽略 SIGCHLD，由内核直接自动回收子进程，防止产生僵尸进程
         libc::signal(libc::SIGCHLD, libc::SIG_IGN);
     }
 
     // 优先尝试基于 pid_max 的极速重置（毫秒级）
-    if try_fast_wrap(&mut logger) {
+    if try_fast_wrap(init_pid, &mut logger) {
         // 回绕完成，恢复 SIGCHLD 默认行为，确保后续 Command::status() 可正常 waitpid
         unsafe {
             libc::signal(libc::SIGCHLD, libc::SIG_DFL);
