@@ -520,7 +520,7 @@ fn try_fast_wrap(cur_pid: libc::pid_t, logger: &mut Logger) -> bool {
     }
 
     let cur = cur_pid as i64;
-    let mut temp_max = (cur + 64).max(MIN_SAFE_TEMP_PID_MAX);
+    let temp_max = (cur + 64).max(MIN_SAFE_TEMP_PID_MAX);
 
     logger.log_info(&format!(
         "[pid_wrap] 当前进程 PID={}, 系统原始 pid_max={}\n",
@@ -556,7 +556,6 @@ fn try_fast_wrap(cur_pid: libc::pid_t, logger: &mut Logger) -> bool {
             temp_max
         ));
     } else {
-        temp_max = orig_pid_max;
         logger.log_info(&format!(
             "[pid_wrap] 当前 PID 已接近系统上限 ({})，无需收缩参数，直接执行极速自然回绕...\n",
             orig_pid_max

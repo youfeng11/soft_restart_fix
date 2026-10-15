@@ -1,31 +1,19 @@
 #!/system/bin/sh
 
-MODDIR="${MODDIR:-${0%/*}}"
-
-if [ -x "$MODDIR/bin/pid_wrap" ]; then
-    "$MODDIR/bin/pid_wrap"
-    exit $?
-elif [ -x "$MODDIR/pid_wrap" ]; then
-    "$MODDIR/pid_wrap"
-    exit $?
+if [ -z "$MODDIR" ]; then
+    case "$0" in
+        */*) MODDIR="${0%/*}" ;;
+        *)   MODDIR="." ;;
+    esac
 fi
 
-# 原生二进制不可用时，进入纯 Shell 循环回绕
-last_pid=$$
-count=0
+if [ -x "$MODDIR/bin/pid_wrap" ]; then
+    exec "$MODDIR/bin/pid_wrap"
+elif [ -x "$MODDIR/pid_wrap" ]; then
+    exec "$MODDIR/pid_wrap"
+fi
 
-while :; do
-    : &
-    current_pid=$!
-    count=$((count + 1))
-    [ $((count % 100)) -eq 0 ] && wait 2>/dev/null
-    [ "$current_pid" -lt "$last_pid" ] && break
-    last_pid=$current_pid
-done
-wait 2>/dev/null
-
-# 更新模块可变简介（Shell 兜底）
-tag="[✅正常 (Shell)]"
+tag="[❌错误，文件缺失]"
 prop_file="$MODDIR/module.prop"
 
 if [ -f "$prop_file" ]; then
@@ -47,3 +35,5 @@ if [ -f "$prop_file" ]; then
         ksud module config set override.description "$real_desc" >/dev/null 2>&1 || true
     fi
 fi
+
+exit 1

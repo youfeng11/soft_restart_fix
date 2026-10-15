@@ -14,13 +14,13 @@
 - **🛡️ 健全的 RAII 安全与回退机制**：
   - 基于 Rust `Drop` trait 实现 `PidMaxGuard`，在临时调整参数期间自动屏蔽进程信号，确保原始 `pid_max` 无论任何异常路径 100% 自动安全复原。
   - 若处于受限环境（如 SELinux 拦截），全自动无缝回退至常规 `vfork()` 循环模式。
-  - 提供 Shell 原生备用兜底逻辑（[`emulated-soft-reboot.sh`](emulated-soft-reboot.sh)）。
+  - 提供自动化执行入口与异常检测（[`emulated-soft-reboot.sh`](emulated-soft-reboot.sh)）。
 - **📱 全架构适配**：支持主流所有 Android CPU 架构：
   - `ARM64` (`aarch64`)
   - `ARM` (`armeabi-v7a`)
   - `x86_64`
   - `x86`
-- **📊 模块可变简介（运行状态即时反馈）**：初次刷入显示 `[⚠️未执行，请执行软重启]`；软重启完成后，根据执行方式动态更新为 `[✅正常]`、`[✅正常 (vfork)]` 或 `[✅正常 (Shell)]`，在 KernelSU 管理器界面一目了然。
+- **📊 模块可变简介（运行状态即时反馈）**：初次刷入显示 `[⚠️未执行，请执行软重启]`；软重启完成后，根据执行方式动态更新为 `[✅正常]` 或 `[✅正常 (vfork)]`；若二进制文件丢失则标记为 `[❌错误，文件缺失]`，在 KernelSU 管理器界面一目了然。
 - **📦 即刷即用**：符合 KernelSU 模块标准规范，安装时自动识别设备架构并剔除冗余文件，体积超小（仅几十 KB）。
 
 ---
@@ -33,7 +33,7 @@ soft_restart_fix/
 ├── src/
 │   └── main.rs                # 核心 Rust 源码（PID 回绕消耗器）
 ├── module.prop                # 模块元信息说明
-├── emulated-soft-reboot.sh    # 软重启执行脚本（含兜底逻辑）
+├── emulated-soft-reboot.sh    # 软重启执行入口脚本
 ├── customize.sh               # KernelSU 模块安装脚本（架构适配）
 ├── build.sh                   # 跨架构 Cargo 构建与 Zip 打包脚本
 └── bin/                       # 各架构预编译二进制文件
