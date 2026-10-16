@@ -1,6 +1,6 @@
 [package]
 name = "pid_wrap"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2021"
 authors = ["由风"]
 description = "Kernel PID wrap fast reset tool for Android soft reboot"
