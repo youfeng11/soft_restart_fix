@@ -90,12 +90,12 @@ impl Logger {
     }
 
     fn log_info(&mut self, msg: &str) {
-        print!("{}", msg);
+        let _ = std::io::stdout().write_all(msg.as_bytes());
         self.write_raw(msg);
     }
 
     fn log_err(&mut self, msg: &str) {
-        eprint!("{}", msg);
+        let _ = std::io::stderr().write_all(msg.as_bytes());
         self.write_raw(msg);
     }
 }
@@ -128,29 +128,20 @@ fn get_current_time_str() -> String {
 #[cfg(unix)]
 fn pwrite_all_at_zero(file: &File, buf: &[u8]) -> std::io::Result<()> {
     let fd = file.as_raw_fd();
-    let ret = unsafe {
-        libc::pwrite(
-            fd,
-            buf.as_ptr() as *const libc::c_void,
-            buf.len(),
-            0,
-        )
-    };
+    let ret = unsafe { libc::pwrite(fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
     if ret < 0 {
         Err(std::io::Error::last_os_error())
     } else if (ret as usize) != buf.len() {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::WriteZero,
-            "partial pwrite to procfs",
-        ))
+        Err(std::io::ErrorKind::WriteZero.into())
     } else {
         Ok(())
     }
 }
 
-// RAII 保护守卫：确保在修改 pid_max 后无论发生何种情况，都能 100% 恢复原始 pid_max 并解除信号屏蔽
+// 正常退出时尝试恢复 pid_max；显式恢复失败后保留句柄，供 Drop 再尝试一次。
+// SIGKILL、panic=abort 等异常终止不会运行 Drop。
 struct PidMaxGuard {
-    file: Option<File>,
+    file: File,
     orig_content: Vec<u8>,
     old_sigs: libc::sigset_t,
     restored: bool,
@@ -159,32 +150,104 @@ struct PidMaxGuard {
 impl PidMaxGuard {
     fn new(file: File, orig_content: Vec<u8>, old_sigs: libc::sigset_t) -> Self {
         Self {
-            file: Some(file),
+            file,
             orig_content,
             old_sigs,
             restored: false,
         }
     }
 
-    fn restore(&mut self) {
+    fn restore(&mut self) -> std::io::Result<()> {
         if !self.restored {
-            if let Some(file) = self.file.take() {
-                if let Err(e) = pwrite_all_at_zero(&file, &self.orig_content) {
-                    eprintln!("[pid_wrap] 恢复 pid_max 失败: {}", e);
-                }
-            }
-            unsafe {
-                libc::sigprocmask(libc::SIG_SETMASK, &self.old_sigs, std::ptr::null_mut());
-            }
+            pwrite_all_at_zero(&self.file, &self.orig_content)?;
             self.restored = true;
         }
+        Ok(())
     }
 }
 
 impl Drop for PidMaxGuard {
     fn drop(&mut self) {
-        self.restore();
+        // 析构期间不输出日志；在恢复尝试结束后再解除信号屏蔽。
+        let _ = self.restore();
+        unsafe {
+            libc::sigprocmask(libc::SIG_SETMASK, &self.old_sigs, std::ptr::null_mut());
+        }
     }
+}
+
+#[derive(Debug)]
+enum FastWrapError {
+    Setup(std::io::Error),
+    Restore(std::io::Error),
+}
+
+#[derive(Debug)]
+struct FastWrapStats {
+    wrapped: bool,
+    attempts: u32,
+    pid: libc::pid_t,
+    consecutive_failures: u32,
+}
+
+// 参数修改窗口内只执行系统调用和计数，不做日志、格式化或堆分配。
+// next_pid 允许测试用临时文件验证失败路径，无需修改真实的系统参数。
+fn wrap_with_pid_max(
+    file: File,
+    orig_content: Vec<u8>,
+    temp_content: Option<&[u8]>,
+    cur_pid: libc::pid_t,
+    mut next_pid: impl FnMut() -> libc::pid_t,
+) -> Result<FastWrapStats, FastWrapError> {
+    let mut all_sigs = std::mem::MaybeUninit::uninit();
+    let mut old_sigs = std::mem::MaybeUninit::uninit();
+    unsafe {
+        if libc::sigfillset(all_sigs.as_mut_ptr()) != 0
+            || libc::sigprocmask(libc::SIG_BLOCK, all_sigs.as_ptr(), old_sigs.as_mut_ptr()) != 0
+        {
+            return Err(FastWrapError::Setup(std::io::Error::last_os_error()));
+        }
+    }
+    let mut guard = PidMaxGuard::new(file, orig_content, unsafe { old_sigs.assume_init() });
+    // 未收缩参数时不需要写回原值。
+    guard.restored = temp_content.is_none();
+
+    if let Some(content) = temp_content {
+        if let Err(error) = pwrite_all_at_zero(&guard.file, content) {
+            guard.restore().map_err(FastWrapError::Restore)?;
+            return Err(FastWrapError::Setup(error));
+        }
+    }
+
+    let mut stats = FastWrapStats {
+        wrapped: false,
+        attempts: 0,
+        pid: cur_pid,
+        consecutive_failures: 0,
+    };
+    let mut last = cur_pid;
+    while stats.attempts < 1000 {
+        stats.attempts += 1;
+        let pid = next_pid();
+        if pid < 0 {
+            stats.consecutive_failures += 1;
+            if stats.consecutive_failures >= 10 {
+                break;
+            }
+            std::thread::yield_now();
+            continue;
+        }
+        stats.pid = pid;
+        stats.consecutive_failures = 0;
+        if pid < last {
+            stats.wrapped = true;
+            break;
+        }
+        last = pid;
+    }
+
+    guard.restore().map_err(FastWrapError::Restore)?;
+    Ok(stats)
 }
 
 /// 零栈触碰的极速 vfork + exit 实现：
@@ -261,7 +324,8 @@ unsafe fn fast_vfork_exit() -> libc::pid_t {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         // 其他架构兜底：直接通过 syscall 调用轻量级 clone(SIGCHLD)，绕过 libc pthread_atfork 开销且不共享栈
-        let pid = libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_long, 0, 0, 0, 0) as libc::pid_t;
+        let pid = libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_long, 0, 0, 0, 0)
+            as libc::pid_t;
         if pid == 0 {
             libc::_exit(0);
         }
@@ -382,9 +446,7 @@ fn update_module_description(tag: &str, logger: &mut Logger) {
 
     let mut write_success = false;
     if let Ok(mut f) = File::create(&temp_target) {
-        if f.write_all(new_content.as_bytes()).is_ok()
-            && f.flush().is_ok()
-            && f.sync_all().is_ok()
+        if f.write_all(new_content.as_bytes()).is_ok() && f.flush().is_ok() && f.sync_all().is_ok()
         {
             write_success = true;
         }
@@ -408,7 +470,7 @@ fn update_module_description(tag: &str, logger: &mut Logger) {
 }
 
 // 尝试利用 /proc/sys/kernel/pid_max 触发内核级瞬间回绕（毫秒级极速完成）
-fn try_fast_wrap(cur_pid: libc::pid_t, logger: &mut Logger) -> bool {
+fn try_fast_wrap(cur_pid: libc::pid_t, logger: &mut Logger) -> std::io::Result<bool> {
     let mut file = match OpenOptions::new()
         .read(true)
         .write(true)
@@ -421,8 +483,9 @@ fn try_fast_wrap(cur_pid: libc::pid_t, logger: &mut Logger) -> bool {
                 e,
                 e.raw_os_error()
             ));
-            logger.log_err("[pid_wrap] 提示: 常见原因为 SELinux 拦截 (avc: denied) 或无 root 权限\n");
-            return false;
+            logger
+                .log_err("[pid_wrap] 提示: 常见原因为 SELinux 拦截 (avc: denied) 或无 root 权限\n");
+            return Ok(false);
         }
     };
 
@@ -432,7 +495,7 @@ fn try_fast_wrap(cur_pid: libc::pid_t, logger: &mut Logger) -> bool {
             "[pid_wrap] 读取 /proc/sys/kernel/pid_max 失败: {}\n",
             e
         ));
-        return false;
+        return Ok(false);
     }
 
     let orig_pid_max: i64 = match orig_buf.trim().parse() {
@@ -442,7 +505,7 @@ fn try_fast_wrap(cur_pid: libc::pid_t, logger: &mut Logger) -> bool {
                 "[pid_wrap] 解析 pid_max 失败: 原始内容: '{}'\n",
                 orig_buf.trim()
             ));
-            return false;
+            return Ok(false);
         }
     };
 
@@ -451,7 +514,7 @@ fn try_fast_wrap(cur_pid: libc::pid_t, logger: &mut Logger) -> bool {
             "[pid_wrap] 读取到异常的 pid_max 原始值: {}\n",
             orig_pid_max
         ));
-        return false;
+        return Ok(false);
     }
 
     let cur = cur_pid as i64;
@@ -462,86 +525,45 @@ fn try_fast_wrap(cur_pid: libc::pid_t, logger: &mut Logger) -> bool {
         cur, orig_pid_max
     ));
 
-    // 阻塞所有信号，确保在微小的修改窗口期间不被中断，原值必定被还原
-    let mut all_sigs = std::mem::MaybeUninit::uninit();
-    let mut old_sigs = std::mem::MaybeUninit::uninit();
-    unsafe {
-        libc::sigfillset(all_sigs.as_mut_ptr());
-        libc::sigprocmask(libc::SIG_BLOCK, all_sigs.as_ptr(), old_sigs.as_mut_ptr());
-    }
-    let old_sigs = unsafe { old_sigs.assume_init() };
-
-    let mut guard = PidMaxGuard::new(file, orig_buf.into_bytes(), old_sigs);
-
-    // 若 temp_max < orig_pid_max，则临时收缩 pid_max；若已接近上限，则不改写文件直接进行自然回绕
-    if temp_max < orig_pid_max {
-        let new_content = format!("{}\n", temp_max);
-        if let Some(f) = &guard.file {
-            if let Err(e) = pwrite_all_at_zero(f, new_content.as_bytes()) {
-                logger.log_err(&format!(
-                    "[pid_wrap] 写入临时 pid_max={} 失败: {}\n",
-                    temp_max, e
-                ));
-                guard.restore();
-                return false;
-            }
-        }
-        logger.log_info(&format!(
-            "[pid_wrap] 极速通道: 临时设置 pid_max={} 成功，正在触发内核瞬间回绕...\n",
-            temp_max
-        ));
-    } else {
+    // 在参数修改前准备好写入内容，所有结果日志均在守卫退出后输出。
+    let temp_content = (temp_max < orig_pid_max).then(|| format!("{}\n", temp_max));
+    if temp_content.is_none() {
         logger.log_info(&format!(
             "[pid_wrap] 当前 PID 已接近系统上限 ({})，无需收缩参数，直接执行极速自然回绕...\n",
             orig_pid_max
         ));
     }
-
-    // 快速触发内核回绕
-    let mut last = cur_pid;
-    let mut p = cur_pid;
-    let mut wrapped = false;
-    let mut attempts = 0;
-    let mut consecutive_eagain = 0;
-    let max_attempts = 1000;
-
-    while attempts < max_attempts {
-        attempts += 1;
-        p = unsafe { fast_vfork_exit() };
-        if p < 0 {
-            consecutive_eagain += 1;
-            // 若连续 10 次无法分配 PID，说明 [300, temp_max) 区间被占满，立即中止以防死转
-            if consecutive_eagain >= 10 {
-                logger.log_err("[pid_wrap] 极速通道连续遇到 EAGAIN，低位区间可能饱和，提前退出\n");
-                break;
-            }
-            std::thread::yield_now();
-            continue;
+    let stats = match wrap_with_pid_max(
+        file,
+        orig_buf.into_bytes(),
+        temp_content.as_ref().map(|content| content.as_bytes()),
+        cur_pid,
+        || unsafe { fast_vfork_exit() },
+    ) {
+        Ok(stats) => stats,
+        Err(FastWrapError::Setup(error)) => {
+            logger.log_err(&format!("[pid_wrap] 极速通道准备失败: {}\n", error));
+            return Ok(false);
         }
-        consecutive_eagain = 0;
-        if p < last {
-            wrapped = true;
-            break;
-        }
-        last = p;
+        Err(FastWrapError::Restore(error)) => return Err(error),
+    };
+
+    if stats.consecutive_failures >= 10 {
+        logger.log_err("[pid_wrap] 极速通道连续 clone 失败，已尝试恢复原始 pid_max\n");
     }
-
-    // 第一时间立刻显式恢复系统原始 pid_max 并解除信号屏蔽
-    guard.restore();
-
-    if !wrapped {
+    if !stats.wrapped {
         logger.log_err(&format!(
             "[pid_wrap] 尝试 {} 次 clone 未检测到回绕，回退到常规模式\n",
-            attempts
+            stats.attempts
         ));
-        return false;
+        return Ok(false);
     }
 
     logger.log_info(&format!(
         "[pid_wrap] 内核极速回绕成功！仅历经 {} 次 clone，PID 已重置到低位: {} (已确保 pid_max={})\n",
-        attempts, p, orig_pid_max
+        stats.attempts, stats.pid, orig_pid_max
     ));
-    true
+    Ok(true)
 }
 
 // 兜底方案：常规循环回绕（回绕即停）
@@ -562,7 +584,8 @@ fn fallback_wrap(init_pid: libc::pid_t, logger: &mut Logger, ts_start: Instant) 
         if p < 0 {
             consecutive_failures += 1;
             if consecutive_failures >= 100 {
-                logger.log_err("[pid_wrap] 连续 clone 失败达到 100 次，系统资源受限，中止降级回绕\n");
+                logger
+                    .log_err("[pid_wrap] 连续 clone 失败达到 100 次，系统资源受限，中止降级回绕\n");
                 return false;
             }
             std::thread::yield_now();
@@ -615,7 +638,21 @@ fn main() {
     }
 
     // 优先尝试基于 pid_max 的极速重置（毫秒级）
-    if try_fast_wrap(init_pid, &mut logger) {
+    let fast_ok = match try_fast_wrap(init_pid, &mut logger) {
+        Ok(wrapped) => wrapped,
+        Err(error) => {
+            unsafe {
+                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+            }
+            logger.log_err(&format!(
+                "[pid_wrap] ❌ 恢复 pid_max 失败: {}，中止 PID 回绕\n",
+                error
+            ));
+            update_module_description("[❌错误]", &mut logger);
+            std::process::exit(1);
+        }
+    };
+    if fast_ok {
         // 回绕完成，恢复 SIGCHLD 默认行为，确保后续 Command::status() 可正常 waitpid
         unsafe {
             libc::signal(libc::SIGCHLD, libc::SIG_DFL);
@@ -645,5 +682,163 @@ fn main() {
         update_module_description("[❌错误]", &mut logger);
         logger.log_err("[pid_wrap] ❌ PID 回绕失败，已更新模块简介状态为错误\n");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const ORIGINAL: &[u8] = b"65536\n";
+    const TEMPORARY: &[u8] = b"16384\n";
+
+    struct TestFile {
+        path: PathBuf,
+        file: File,
+    }
+
+    impl TestFile {
+        fn new() -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "pid-wrap-test-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(ORIGINAL).unwrap();
+            Self { path, file }
+        }
+
+        fn read(&self) -> Vec<u8> {
+            std::fs::read(&self.path).unwrap()
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn current_signal_mask() -> libc::sigset_t {
+        let mut mask = std::mem::MaybeUninit::uninit();
+        assert_eq!(
+            unsafe { libc::sigprocmask(libc::SIG_BLOCK, std::ptr::null(), mask.as_mut_ptr()) },
+            0
+        );
+        unsafe { mask.assume_init() }
+    }
+
+    #[test]
+    fn failed_restore_retains_file_and_allows_retry() {
+        let fixture = TestFile::new();
+        pwrite_all_at_zero(&fixture.file, TEMPORARY).unwrap();
+        let mut guard = PidMaxGuard::new(
+            File::open(&fixture.path).unwrap(),
+            ORIGINAL.to_vec(),
+            current_signal_mask(),
+        );
+        let fd = guard.file.as_raw_fd();
+        assert!(guard.restore().is_err());
+        assert!(!guard.restored);
+        assert_eq!(guard.file.as_raw_fd(), fd);
+        assert_eq!(fixture.read(), TEMPORARY);
+
+        guard.file = fixture.file.try_clone().unwrap();
+        guard.restore().unwrap();
+        assert!(guard.restored);
+        assert_eq!(fixture.read(), ORIGINAL);
+    }
+
+    #[test]
+    fn drop_restores_without_an_explicit_restore() {
+        let fixture = TestFile::new();
+        {
+            let guard = PidMaxGuard::new(
+                fixture.file.try_clone().unwrap(),
+                ORIGINAL.to_vec(),
+                current_signal_mask(),
+            );
+            pwrite_all_at_zero(&guard.file, TEMPORARY).unwrap();
+        }
+        assert_eq!(fixture.read(), ORIGINAL);
+    }
+
+    #[test]
+    fn successful_wrap_restores_original_value() {
+        let fixture = TestFile::new();
+        let mut pids = [20001, 300].into_iter();
+        let stats = wrap_with_pid_max(
+            fixture.file.try_clone().unwrap(),
+            ORIGINAL.to_vec(),
+            Some(TEMPORARY),
+            20000,
+            || pids.next().unwrap(),
+        )
+        .unwrap();
+        assert!(stats.wrapped);
+        assert_eq!(stats.attempts, 2);
+        assert_eq!(stats.pid, 300);
+        assert_eq!(fixture.read(), ORIGINAL);
+    }
+
+    #[test]
+    fn allocation_failures_restore_before_returning() {
+        let fixture = TestFile::new();
+        let stats = wrap_with_pid_max(
+            fixture.file.try_clone().unwrap(),
+            ORIGINAL.to_vec(),
+            Some(TEMPORARY),
+            20000,
+            || -1,
+        )
+        .unwrap();
+        assert!(!stats.wrapped);
+        assert_eq!(stats.attempts, 10);
+        assert_eq!(fixture.read(), ORIGINAL);
+    }
+
+    #[test]
+    fn restore_failure_after_wrap_is_a_fatal_error() {
+        let fixture = TestFile::new();
+        let file = fixture.file.try_clone().unwrap();
+        let fd = file.as_raw_fd();
+        let readonly = File::open(&fixture.path).unwrap();
+        let before = current_signal_mask();
+        let result = wrap_with_pid_max(file, ORIGINAL.to_vec(), Some(TEMPORARY), 20000, || {
+            // 写入临时值后，将守卫的句柄替换为只读句柄，注入恢复失败。
+            assert_eq!(unsafe { libc::dup2(readonly.as_raw_fd(), fd) }, fd);
+            300
+        });
+        assert!(matches!(result, Err(FastWrapError::Restore(_))));
+        assert_eq!(fixture.read(), TEMPORARY);
+        let after = current_signal_mask();
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGCHLD] {
+            assert_eq!(unsafe { libc::sigismember(&before, signal) }, unsafe {
+                libc::sigismember(&after, signal)
+            });
+        }
+    }
+
+    #[test]
+    fn unchanged_pid_max_needs_no_write_permission() {
+        let fixture = TestFile::new();
+        let stats = wrap_with_pid_max(
+            File::open(&fixture.path).unwrap(),
+            ORIGINAL.to_vec(),
+            None,
+            20000,
+            || 300,
+        )
+        .unwrap();
+        assert!(stats.wrapped);
+        assert_eq!(fixture.read(), ORIGINAL);
     }
 }
