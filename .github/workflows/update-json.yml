@@ -1,0 +1,73 @@
+name: Update Module Manifest
+
+on:
+  workflow_call:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+
+      - name: Update update.json after release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          from urllib.parse import quote
+
+          props = dict(
+              line.split("=", 1)
+              for line in Path("module.prop").read_text(encoding="utf-8").splitlines()
+              if "=" in line and not line.startswith("#")
+          )
+          tag = os.environ["GITHUB_REF_NAME"]
+          if props["version"] != tag:
+              raise SystemExit("Release tag must match module.prop version.")
+          version_code = int(props["versionCode"])
+          if version_code <= 0:
+              raise SystemExit("module.prop versionCode must be positive.")
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          endpoint = f"repos/{repo}/contents/update.json"
+          current = json.loads(subprocess.check_output(
+              ["gh", "api", endpoint + "?ref=main"], text=True
+          ))
+          previous = json.loads(base64.b64decode(current["content"]))
+          if version_code < int(previous["versionCode"]):
+              print("A newer version is already advertised; skipping update.json.")
+              raise SystemExit(0)
+          if version_code == int(previous["versionCode"]) and tag != previous["version"]:
+              raise SystemExit("Increase module.prop versionCode for a new version.")
+
+          release_url = f'{os.environ["GITHUB_SERVER_URL"]}/{repo}/releases/download/{quote(tag, safe="")}'
+          manifest = {
+              "version": tag,
+              "versionCode": version_code,
+              "zipUrl": release_url + "/soft_restart_fix.zip",
+              "changelog": release_url + "/changelog.md",
+          }
+          if manifest == previous:
+              print("update.json is already up to date.")
+              raise SystemExit(0)
+
+          content = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+          # Contents API uses the authenticated bot identity; do not override author/committer.
+          payload = {
+              "message": f"chore: update module manifest for {tag}",
+              "content": base64.b64encode(content).decode("ascii"),
+              "sha": current["sha"],
+              "branch": "main",
+          }
+          subprocess.run(
+              ["gh", "api", "--method", "PUT", endpoint, "--input", "-"],
+              input=json.dumps(payload), text=True, check=True, stdout=subprocess.DEVNULL,
+          )
+          print(f"Updated main/update.json for {tag}.")
+          PY

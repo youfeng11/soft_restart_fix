@@ -15,14 +15,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -45,9 +42,28 @@ jobs:
         with:
           name: soft_restart_fix
           path: soft_restart_fix.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download built package
+        uses: actions/download-artifact@v4
+        with:
+          name: soft_restart_fix
 
       - name: Generate Release Changelog
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           git fetch --tags --force 2>/dev/null || true
 
@@ -79,12 +95,18 @@ jobs:
           cat changelog.md
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          fail_on_unmatched_files: true
           files: |
             soft_restart_fix.zip
             changelog.md
           body_path: changelog.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-manifest:
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/update-json.yml
