@@ -37,7 +37,18 @@
 
 ## 从源码构建
 
-准备 Bash、Rust 工具链（含 rustup）、Android NDK，以及 Python 3 或 `zip`，在项目目录执行：
+准备 Rust 工具链（含 rustup）和 Android NDK，在项目目录执行。
+
+**Windows（PowerShell 5.1 或更新版本）：**
+
+```powershell
+.\build.ps1
+
+# 或显式指定 NDK 路径
+.\build.ps1 -NdkPath "D:\SDK\ndk\26.1.10909125"
+```
+
+**Linux / macOS（还需 Bash，以及 Python 3 或 `zip`）：**
 
 ```bash
 ./build.sh
